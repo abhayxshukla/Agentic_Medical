@@ -1,0 +1,149 @@
+.upload-container {
+  min-height: 100vh;
+  background: linear-gradient(135deg, #CCFBF1 0%, #FFFFFF 50%, #E0F2FE 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.upload-content {
+  max-width: 700px;
+  width: 100%;
+}
+
+.upload-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.upload-header h2 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  color: var(--gray-900);
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  padding: 8px;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-btn:hover {
+  background-color: var(--gray-100);
+}
+
+.drop-zone {
+  border: 3px dashed var(--gray-300);
+  border-radius: 12px;
+  padding: 48px 24px;
+  text-align: center;
+  transition: all 0.3s ease;
+  background-color: var(--white);
+}
+
+.drop-zone.active {
+  border-color: var(--primary);
+  background-color: #EFF6FF;
+}
+
+.drop-zone:hover {
+  border-color: var(--primary);
+}
+
+.drop-zone h3 {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: var(--gray-900);
+  margin-bottom: 8px;
+  margin-top: 16px;
+}
+
+.drop-zone p {
+  color: var(--gray-600);
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
+
+.file-input {
+  display: none;
+}
+
+.file-label {
+  display: inline-block;
+  cursor: pointer;
+}
+
+/* Style the label as a button */
+label.btn-secondary {
+  margin-top: 16px;
+  cursor: pointer;
+  user-select: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.file-info {
+  margin-top: 24px;
+  padding: 16px;
+  background-color: var(--gray-50);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.file-info-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.file-info-text h4 {
+  font-weight: 600;
+  color: var(--gray-900);
+  margin-bottom: 4px;
+}
+
+.file-info-text p {
+  font-size: 0.875rem;
+  color: var(--gray-600);
+}
+
+.progress-container {
+  margin-top: 24px;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.progress-header span {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.progress-percent {
+  color: var(--primary);
+}
+
+@media (max-width: 768px) {
+  .upload-header h2 {
+    font-size: 1.5rem;
+  }
+  
+  .drop-zone {
+    padding: 32px 16px;
+  }
+}
