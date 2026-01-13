@@ -1,0 +1,10 @@
+{
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": false,
+  "ignore": [
+    "**/medicin/ocr_service.py"
+  ],
+  "stubPath": "",
+  "venvPath": ".",
+  "venv": "."
+}

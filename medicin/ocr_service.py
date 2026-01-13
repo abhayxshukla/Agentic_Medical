@@ -1,7 +1,7 @@
-import cv2
+import cv2  # type: ignore[import]
 import numpy as np
-import boto3
-import pytesseract
+import boto3  # type: ignore[import]
+import pytesseract  # type: ignore[import]
 from typing import Optional, Dict
 import logging
 import os
@@ -51,19 +51,32 @@ def extract_text_with_textract(image_path: str) -> Optional[Dict]:
             logger.warning("Image too large for Textract (>5MB)")
             return None
         
-        # Call Textract
-        response = textract_client.detect_document_text(
-            Document={'Bytes': image_bytes}
-        )
+        # Call Textract - using analyze_document for better handwritten support
+        # This API provides better handwritten text recognition than detect_document_text
+        try:
+            response = textract_client.analyze_document(
+                Document={'Bytes': image_bytes},
+                FeatureTypes=['FORMS', 'TABLES']  # Better for handwritten forms
+            )
+        except Exception:
+            # Fallback to detect_document_text if analyze_document fails
+            response = textract_client.detect_document_text(
+                Document={'Bytes': image_bytes}
+            )
         
         # Extract text with confidence
+        # Handle both analyze_document and detect_document_text responses
         text_lines = []
         confidences = []
         
-        for block in response['Blocks']:
-            if block['BlockType'] == 'LINE':
-                text_lines.append(block['Text'])
-                confidences.append(block['Confidence'])
+        for block in response.get('Blocks', []):
+            block_type = block.get('BlockType', '')
+            # LINE works for both APIs, also check for WORD blocks in forms
+            if block_type in ['LINE', 'WORD']:
+                if 'Text' in block:
+                    text_lines.append(block['Text'])
+                if 'Confidence' in block:
+                    confidences.append(block['Confidence'])
         
         avg_confidence = sum(confidences) / len(confidences) if confidences else 0
         extracted_text = '\n'.join(text_lines)
@@ -155,10 +168,13 @@ def extract_text_from_image(image_path: str) -> Optional[str]:
     
     Strategy:
     1. Always try Textract first (handles both handwritten and printed)
+       - Uses analyze_document API for better handwritten recognition
+       - Falls back to detect_document_text if needed
     2. Use Tesseract only if:
        - Textract fails
        - Textract quota exceeded
        - Textract returns low confidence/empty result
+       - Note: Tesseract is primarily for printed text, not handwritten
     """
     logger.info(f"🔍 Starting OCR for: {image_path}")
     

@@ -6,17 +6,17 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from llama_index.llms.groq import Groq
+from llama_index.llms.groq import Groq  # type: ignore[import]
 from llama_index.core.memory import Memory
 from datetime import datetime
 from llama_index.core.chat_engine import SimpleChatEngine, ContextChatEngine
 from llama_index.core import Settings
 from medicin.ocr_service import check_image_quality, extract_text_from_image
 from llama_index.core.schema import Document
-from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.vector_stores.postgres import PGVectorStore  # type: ignore[import]
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
-from llama_index.readers.file import PDFReader, ImageReader, DocxReader
+from llama_index.readers.file import PDFReader, ImageReader, DocxReader  # type: ignore[attr-defined]
 from medicin.sharedembeddings import get_shared_embedding
 from werkzeug.utils import secure_filename
 import logging
@@ -34,10 +34,29 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Import and include geo routes
+from medicin.geo_routes import router as geo_router
+app.include_router(geo_router)
+
+# Import and include multilingual routes
+from medicin.multilingual_routes import router as multilingual_router
+app.include_router(multilingual_router)
+
+# Import and include OCR+Geo integrated routes
+from medicin.ocr_geo_routes import router as ocr_geo_router
+app.include_router(ocr_geo_router)
+
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8080",
+        "file://"  # Allow local file access
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,34 +72,44 @@ Settings.llm = llm
 Settings.embed_model = get_shared_embedding()
 
 # Database configuration
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = os.getenv('DB_PASSWORD')
-DB_HOST = os.getenv('DB_HOST')
-DB_PORT = os.getenv('DB_PORT')
-DB_NAME = os.getenv('DB_NAME')
+DB_USER = os.getenv('DB_USER', '')
+DB_PASSWORD = os.getenv('DB_PASSWORD', '')
+DB_HOST = os.getenv('DB_HOST', '')
+DB_PORT = os.getenv('DB_PORT', '')
+DB_NAME = os.getenv('DB_NAME', '')
 
-encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
+# Handle None password case
+encoded_password = urllib.parse.quote_plus(DB_PASSWORD or "")
 connection_string = f"postgresql+psycopg2://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 async_connection_string = f"postgresql+asyncpg://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Medicine database vector store
-vector_store = PGVectorStore(
-    connection_string=connection_string,
-    async_connection_string=async_connection_string,
-    table_name="medicine_db",
-    embed_dim=1024,
-    perform_setup=False,
-    schema_name="vector"
-)
+# Medicine database vector store (with fallback)
+medicine_index = None
+medicine_retriever = None
 
-medicine_index = VectorStoreIndex.from_vector_store(
-    vector_store=vector_store,
-    embed_model=Settings.embed_model
-)
-logger.info("Medicine database index loaded successfully")
-
-# Medicine recommendation retriever
-medicine_retriever = VectorIndexRetriever(index=medicine_index, similarity_top_k=3)
+try:
+    if all([DB_USER, DB_PASSWORD, DB_HOST, DB_NAME]):
+        vector_store = PGVectorStore(
+            connection_string=connection_string,
+            async_connection_string=async_connection_string,
+            table_name="medicine_db",
+            embed_dim=1024,
+            perform_setup=False,
+            schema_name="vector"
+        )
+        
+        medicine_index = VectorStoreIndex.from_vector_store(
+            vector_store=vector_store,
+            embed_model=Settings.embed_model
+        )
+        logger.info("Medicine database index loaded successfully")
+        
+        medicine_retriever = VectorIndexRetriever(index=medicine_index, similarity_top_k=3)
+    else:
+        logger.warning("Database credentials not set, medicine recommendations will use LLM only")
+except Exception as e:
+    logger.warning(f"Failed to load medicine database: {e}")
+    logger.info("Medicine recommendations will use LLM only (no vector database)")
 
 # Prompts
 medicine_prompt = (
@@ -90,11 +119,21 @@ medicine_prompt = (
     "Symptoms/Query: {query_str}\n"
 )
 
-medicine_chat_engine = ContextChatEngine.from_defaults(
-    retriever=medicine_retriever,
-    context_template=medicine_prompt,
-    llm=llm,
-)
+# Medicine chat engine (only if database available)
+medicine_chat_engine = None
+if medicine_retriever:
+    try:
+        medicine_chat_engine = ContextChatEngine.from_defaults(
+            retriever=medicine_retriever,
+            context_template=medicine_prompt,
+            llm=llm,
+        )
+        logger.info("Medicine chat engine initialized with database")
+    except Exception as e:
+        logger.warning(f"Failed to create medicine chat engine: {e}")
+        medicine_chat_engine = None
+else:
+    logger.info("Medicine chat engine will use LLM only (no database)")
 
 symptom_prompt = (
     """You are a friendly and empathetic medical assistant. Have a natural conversation 
@@ -134,6 +173,9 @@ class ChatResponse(BaseModel):
     symptoms_summary: Optional[str] = None
     medicine_recommendation: Optional[str] = None
     session_id: str
+    severity: Optional[str] = None
+    suggested_specialty: Optional[str] = None
+    specialty_display: Optional[str] = None
 
 class DocumentChatRequest(BaseModel):
     session_id: str
@@ -218,7 +260,7 @@ async def start_symptom_chat():
 
 @app.post("/chat_symptoms", response_model=ChatResponse)
 async def chat_symptoms(request: ChatMessage):
-    """Continue symptom conversation and get medicine recommendation"""
+    """Continue symptom conversation, classify severity, and recommend specialists"""
     try:
         if not request.session_id or request.session_id not in user_sessions:
             raise HTTPException(status_code=400, detail="Invalid session_id")
@@ -232,28 +274,50 @@ async def chat_symptoms(request: ChatMessage):
         response = session['engine'].chat(request.message)
         response_text = str(response)
         
+        # Extract all user messages (symptoms) for severity classification
+        all_messages = session['memory'].get_all()
+        user_symptoms = " ".join([m.content for m in all_messages if m.role == "user"])
+        
+        # Classify severity and get specialty recommendation
+        from agents.decision_agent import classify_severity
+        from tools.symptom_specialty_mapper import map_symptoms_to_specialty, get_specialty_display_name
+        
+        severity = classify_severity(user_symptoms)
+        specialty = map_symptoms_to_specialty(user_symptoms)
+        specialty_display = get_specialty_display_name(specialty) if specialty else None
+        
         # Check if symptom gathering is complete
-        if "SYMPTOMS_COMPLETE" in response_text:
-            # Extract all user messages (symptoms)
-            all_messages = session['memory'].get_all()
-            user_symptoms = " ".join([m.content for m in all_messages if m.role == "user"])
+        if "SYMPTOMS_COMPLETE" in response_text or len(user_symptoms) > 50:
+            # Get medicine recommendation from database or LLM
+            if medicine_chat_engine:
+                medicine_response = medicine_chat_engine.chat(user_symptoms)
+            else:
+                # Fallback to direct LLM when database unavailable
+                medicine_prompt = f"""Based on these symptoms: {user_symptoms}
+
+Provide appropriate medicine recommendations with dosage and usage instructions.
+Be specific and professional. Remember: This is not a medical diagnosis."""
+                medicine_response = llm.complete(medicine_prompt)
             
-            # Get medicine recommendation from database
-            medicine_response = medicine_chat_engine.chat(user_symptoms)
-            
-            logger.info(f"Symptom assessment complete for session: {request.session_id}")
+            logger.info(f"Symptom assessment complete for session: {request.session_id}, severity: {severity}")
             
             return ChatResponse(
                 status="complete",
                 symptoms_summary=user_symptoms,
                 medicine_recommendation=str(medicine_response),
-                session_id=request.session_id
+                session_id=request.session_id,
+                severity=severity,
+                suggested_specialty=specialty,
+                specialty_display=specialty_display
             )
         else:
             return ChatResponse(
                 status="ongoing",
                 response=response_text,
-                session_id=request.session_id
+                session_id=request.session_id,
+                severity=severity,
+                suggested_specialty=specialty,
+                specialty_display=specialty_display
             )
             
     except HTTPException:

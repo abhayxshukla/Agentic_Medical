@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="AI-powered Medical Assistant for symptom analysis and doctor recommendations">
+    <title>Medical Assistant - AI Healthcare Support</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header role="banner">
+            <div class="header-content">
+                <div class="header-main">
+                    <i class="fas fa-hospital-alt" aria-hidden="true"></i>
+                    <h1 id="app-title">Medical Assistant</h1>
+                </div>
+                <div class="language-switcher">
+                    <label for="language-select" id="language-label">
+                        <i class="fas fa-language" aria-hidden="true"></i> 
+                        <span id="language-label-text">Language</span>:
+                    </label>
+                    <select id="language-select" aria-label="Select language" onchange="changeLanguage(this.value)">
+                        <option value="en">English</option>
+                        <option value="hi">हिंदी</option>
+                        <option value="ta">தமிழ்</option>
+                        <option value="ml">മലയാളം</option>
+                        <option value="pa">ਪੰਜਾਬੀ</option>
+                        <option value="ur">اردو</option>
+                    </select>
+                </div>
+            </div>
+        </header>
+
+        <!-- Tab Navigation -->
+        <nav class="tabs-container" role="tablist" aria-label="Main navigation">
+            <button class="tab-btn active" onclick="showTab('symptoms')" id="tab-symptoms" role="tab" aria-selected="true" aria-controls="symptoms-tab">
+                <i class="fas fa-comments" aria-hidden="true"></i>
+                <span id="tab-symptoms-text">Symptom Chat</span>
+            </button>
+            <button class="tab-btn" onclick="showTab('document')" id="tab-document" role="tab" aria-selected="false" aria-controls="document-tab">
+                <i class="fas fa-file-upload" aria-hidden="true"></i>
+                <span id="tab-document-text">Upload Report</span>
+            </button>
+        </nav>
+
+        <!-- Symptom Chat Tab -->
+        <section id="symptoms-tab" class="tab-content active" role="tabpanel" aria-labelledby="tab-symptoms">
+            <div class="card main-card">
+                <div class="state-indicator" id="symptom-state">
+                    <span class="state-badge" data-translate="waiting_input">Waiting for input</span>
+                </div>
+                
+                <h2 id="symptoms-title">
+                    <i class="fas fa-stethoscope" aria-hidden="true"></i> 
+                    <span id="symptoms-title-text">Describe Your Symptoms</span>
+                </h2>
+                <p class="subtitle" id="symptoms-subtitle">
+                    Enter your symptoms in any language. Our AI will analyze and recommend appropriate care.
+                </p>
+                
+                <!-- Sample Symptoms Helper -->
+                <div class="sample-inputs" id="sample-symptoms-container">
+                    <p class="sample-label" data-translate="try_examples">Try these examples:</p>
+                    <div class="sample-chips">
+                        <button class="sample-chip" onclick="fillSymptomExample('chest pain')" data-translate-example="chest_pain">Chest pain</button>
+                        <button class="sample-chip" onclick="fillSymptomExample('headache')" data-translate-example="headache">Headache</button>
+                        <button class="sample-chip" onclick="fillSymptomExample('fever')" data-translate-example="fever">Fever</button>
+                        <button class="sample-chip" onclick="fillSymptomExample('cough')" data-translate-example="cough">Cough</button>
+                    </div>
+                </div>
+                
+                <div class="chat-container">
+                    <div id="symptom-chat-messages" class="chat-messages" role="log" aria-live="polite" aria-label="Chat messages"></div>
+                    <div class="chat-input-area">
+                        <label for="symptom-input" class="sr-only" data-translate="symptom_input_label">Enter your symptoms</label>
+                        <input 
+                            type="text" 
+                            id="symptom-input" 
+                            placeholder="Example: I have been experiencing chest pain for 2 days..."
+                            aria-label="Symptom input"
+                            autocomplete="off"
+                        />
+                        <button id="send-symptom-btn" class="btn btn-primary" aria-label="Send message">
+                            <i class="fas fa-paper-plane" aria-hidden="true"></i>
+                            <span id="send-btn-text">Send</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Results Section (hidden by default) -->
+                <div id="symptom-results" class="results-section hidden">
+                    <div id="symptom-severity" class="severity-card hidden" role="alert"></div>
+                    <div id="symptom-specialty" class="specialty-card hidden"></div>
+                    <div id="symptom-hospitals" class="hospitals-section hidden"></div>
+                    <div id="symptom-map" class="map-section hidden" aria-label="Map showing nearby hospitals"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Document Upload Tab -->
+        <section id="document-tab" class="tab-content" role="tabpanel" aria-labelledby="tab-document">
+            <div class="card main-card">
+                <div class="state-indicator" id="document-state">
+                    <span class="state-badge" data-translate="waiting_input">Waiting for input</span>
+                </div>
+                
+                <h2 id="document-title">
+                    <i class="fas fa-file-medical" aria-hidden="true"></i> 
+                    <span id="document-title-text">Upload Medical Report</span>
+                </h2>
+                <p class="subtitle" id="document-subtitle">
+                    Upload your prescription, lab report, or medical document for analysis.
+                </p>
+                
+                <div class="upload-container">
+                    <div class="upload-area" id="upload-area" role="button" tabindex="0" aria-label="Upload area">
+                        <i class="fas fa-cloud-upload-alt upload-icon" aria-hidden="true"></i>
+                        <p id="upload-text">Drop your medical document here or click to browse</p>
+                        <p class="upload-hint" id="upload-hint">Supports: PDF, PNG, JPG, DOCX (Max 16MB)</p>
+                        <input 
+                            type="file" 
+                            id="file-input" 
+                            accept=".pdf,.png,.jpg,.jpeg,.docx" 
+                            aria-label="Choose file"
+                            hidden
+                        />
+                        <button class="btn btn-primary" onclick="document.getElementById('file-input').click()" aria-label="Choose file button">
+                            <i class="fas fa-folder-open" aria-hidden="true"></i>
+                            <span id="choose-file-text">Choose File</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div id="file-info" class="file-info hidden" role="status" aria-live="polite"></div>
+
+                <!-- Analysis Results (hidden by default) -->
+                <div id="document-results" class="results-section hidden">
+                    <div id="document-severity" class="severity-card hidden" role="alert"></div>
+                    <div id="document-findings" class="findings-card hidden"></div>
+                    <div id="document-specialty" class="specialty-card hidden"></div>
+                    <div id="document-hospitals" class="hospitals-section hidden"></div>
+                    <div id="document-map" class="map-section hidden" aria-label="Map showing nearby hospitals"></div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Location Input Modal (for manual GPS/address input) -->
+    <div id="location-modal" class="modal hidden" role="dialog" aria-labelledby="location-modal-title" aria-hidden="true">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="location-modal-title" data-translate="enter_location">Enter Your Location</h3>
+                <button class="modal-close" onclick="closeLocationModal()" aria-label="Close">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="location-input-tabs">
+                    <button class="location-tab active" onclick="showLocationTab('gps')" data-translate="gps_coordinates">GPS Coordinates</button>
+                    <button class="location-tab" onclick="showLocationTab('address')" data-translate="address">Address</button>
+                </div>
+                
+                <!-- GPS Coordinates Input -->
+                <div id="gps-input-section" class="location-input-section">
+                    <label for="gps-lat" data-translate="latitude">Latitude:</label>
+                    <input 
+                        type="number" 
+                        id="gps-lat" 
+                        step="any" 
+                        placeholder="Example: 28.6139"
+                        aria-label="Latitude"
+                    />
+                    <small class="input-hint" data-translate="lat_range">Range: -90 to 90</small>
+                    
+                    <label for="gps-lon" data-translate="longitude">Longitude:</label>
+                    <input 
+                        type="number" 
+                        id="gps-lon" 
+                        step="any" 
+                        placeholder="Example: 77.2090"
+                        aria-label="Longitude"
+                    />
+                    <small class="input-hint" data-translate="lon_range">Range: -180 to 180</small>
+                    
+                    <button class="btn btn-primary" onclick="submitGPSCoordinates()" data-translate="find_doctors">Find Doctors</button>
+                </div>
+                
+                <!-- Address Input -->
+                <div id="address-input-section" class="location-input-section hidden">
+                    <label for="address-input" data-translate="enter_address">Enter Address:</label>
+                    <input 
+                        type="text" 
+                        id="address-input" 
+                        placeholder="Example: Delhi, India or 123 Main St, Mumbai"
+                        aria-label="Address"
+                    />
+                    <small class="input-hint" data-translate="address_hint">Enter city, state, or full address</small>
+                    
+                    <button class="btn btn-primary" onclick="submitAddress()" data-translate="find_doctors">Find Doctors</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden" role="status" aria-live="polite" aria-label="Loading">
+        <div class="loading-spinner">
+            <div class="spinner"></div>
+            <p id="loading-text" data-translate="processing">Processing...</p>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer role="contentinfo">
+        <p>
+            <i class="fas fa-phone-alt" aria-hidden="true"></i>
+            <span data-translate="emergency_number">Emergency: Call 112</span>
+        </p>
+        <p class="disclaimer-text" data-translate="disclaimer">
+            This is not a medical diagnosis. Always consult qualified healthcare professionals.
+        </p>
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
