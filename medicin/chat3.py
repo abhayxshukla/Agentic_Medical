@@ -1,7 +1,7 @@
 import urllib.parse
 import os
 import uuid
-from typing import Optional
+from typing import List, Dict, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,6 +19,12 @@ from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.readers.file import PDFReader, ImageReader, DocxReader
 from medicin.sharedembeddings import get_shared_embedding
 from werkzeug.utils import secure_filename
+from medicin.geolocation_service import (
+    find_nearby_hospitals_overpass,
+    format_hospitals_for_chat,
+    extract_specialty_from_symptoms
+)
+
 import logging
 
 # Configure logging
@@ -162,6 +168,26 @@ class SessionInfoResponse(BaseModel):
     type: str
     filename: Optional[str] = None
     pages: Optional[int] = None
+
+class LocationRequest(BaseModel):
+    pin_code: str
+    specialty: Optional[str] = None
+    radius_km: float = 10
+
+
+class LocationResponse(BaseModel):
+    status: str
+    pin_code: str
+    hospitals: List[Dict]
+    formatted_response: str
+    location: Optional[Dict] = None
+
+
+class ChatWithLocationRequest(BaseModel):
+    session_id: str
+    message: str
+    pin_code: Optional[str] = None
+
 
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -433,6 +459,187 @@ async def chat_with_document(request: DocumentChatRequest):
     except Exception as e:
         logger.error(f"Error in document chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+# ==================== GEOLOCATION ENDPOINTS ====================
+
+@app.post("/find_nearby_hospitals", response_model=LocationResponse)
+async def find_nearby_hospitals(request: LocationRequest):
+    """
+    Find nearby hospitals/clinics based on PIN code and optional specialty.
+    Uses OpenStreetMap data via Overpass API + geopy.
+    """
+    try:
+        # Validate PIN code format
+        if not request.pin_code or len(request.pin_code) != 6 or not request.pin_code.isdigit():
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid PIN code. Must be 6 digits."
+            )
+        
+        # Search for hospitals
+        geo_result = find_nearby_hospitals_overpass(
+            pin_code=request.pin_code,
+            specialty=request.specialty,
+            radius_km=request.radius_km
+        )
+        
+        if geo_result['status'] != 'success':
+            raise HTTPException(status_code=404, detail=geo_result['message'])
+        
+        # Format for display
+        formatted = format_hospitals_for_chat(geo_result)
+        
+        logger.info(f"Location query: PIN {request.pin_code}, "
+                   f"Specialty: {request.specialty or 'Any'}, "
+                   f"Found: {len(geo_result['hospitals'])}")
+        
+        return LocationResponse(
+            status=geo_result['status'],
+            pin_code=geo_result['pin_code'],
+            hospitals=geo_result['hospitals'],
+            formatted_response=formatted,
+            location=geo_result.get('location')
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in hospital search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat_symptoms_with_location")
+async def chat_symptoms_with_location(request: ChatWithLocationRequest):
+    """
+    Enhanced symptom chat that includes nearby hospital recommendations.
+    Automatically detects specialty from symptoms.
+    """
+    try:
+        if not request.session_id or request.session_id not in user_sessions:
+            raise HTTPException(status_code=400, detail="Invalid session_id")
+        
+        session = user_sessions[request.session_id]
+        
+        if session['type'] != 'symptom':
+            raise HTTPException(status_code=400, detail="This session is not for symptom chat")
+        
+        # Continue conversation
+        response = session['engine'].chat(request.message)
+        response_text = str(response)
+        
+        # Check if symptom gathering is complete
+        if "SYMPTOMS_COMPLETE" in response_text:
+            # Extract symptoms
+            all_messages = session['memory'].get_all()
+            user_symptoms = " ".join([m.content for m in all_messages if m.role == "user"])
+            
+            # Get medicine recommendation
+            medicine_response = medicine_chat_engine.chat(user_symptoms)
+            
+            # NEW: Find nearby specialists if PIN provided
+            location_info = None
+            if request.pin_code:
+                # Auto-detect specialty from symptoms
+                specialty = extract_specialty_from_symptoms(user_symptoms)
+                
+                logger.info(f"Finding specialists for PIN {request.pin_code}, "
+                           f"specialty: {specialty or 'General'}")
+                
+                geo_result = find_nearby_hospitals_overpass(
+                    pin_code=request.pin_code,
+                    specialty=specialty,
+                    radius_km=10
+                )
+                
+                if geo_result['status'] == 'success':
+                    location_info = {
+                        'hospitals': geo_result['hospitals'],
+                        'formatted': format_hospitals_for_chat(geo_result),
+                        'specialty_detected': specialty
+                    }
+            
+            return {
+                "status": "complete",
+                "symptoms_summary": user_symptoms,
+                "medicine_recommendation": str(medicine_response),
+                "location_info": location_info,
+                "session_id": request.session_id
+            }
+        else:
+            return {
+                "status": "ongoing",
+                "response": response_text,
+                "session_id": request.session_id
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in symptom chat with location: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat_document_with_location")
+async def chat_document_with_location(request: ChatWithLocationRequest):
+    """
+    Enhanced document chat that can recommend nearby specialists based on
+    prescription/report analysis.
+    """
+    try:
+        if not request.session_id or request.session_id not in user_sessions:
+            raise HTTPException(status_code=404, detail="Invalid session_id")
+        
+        session = user_sessions[request.session_id]
+        
+        if session['type'] != 'document':
+            raise HTTPException(status_code=400, detail="This session does not have a document")
+        
+        # Update last accessed
+        session['last_accessed'] = datetime.utcnow()
+        
+        # Chat with document
+        response = session['chat_engine'].chat(request.message)
+        response_text = str(response)
+        
+        # NEW: If PIN provided and response mentions specialist/consultation
+        location_info = None
+        if request.pin_code and any(keyword in response_text.lower() 
+                                    for keyword in ['specialist', 'consult', 'doctor', 'visit']):
+            
+            # Extract document text for specialty detection
+            doc_text = " ".join([doc.text for doc in session['documents']])
+            specialty = extract_specialty_from_symptoms(doc_text + " " + response_text)
+            
+            logger.info(f"Document suggests specialist consultation. "
+                       f"Finding hospitals for PIN {request.pin_code}")
+            
+            geo_result = find_nearby_hospitals_overpass(
+                pin_code=request.pin_code,
+                specialty=specialty,
+                radius_km=10
+            )
+            
+            if geo_result['status'] == 'success':
+                location_info = {
+                    'hospitals': geo_result['hospitals'],
+                    'formatted': format_hospitals_for_chat(geo_result),
+                    'specialty_detected': specialty
+                }
+        
+        return {
+            "response": response_text,
+            "document": session['filename'],
+            "location_info": location_info,
+            "session_id": request.session_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in document chat with location: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # ==================== UTILITY ENDPOINTS ====================

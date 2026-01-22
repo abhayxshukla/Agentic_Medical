@@ -1,0 +1,91 @@
+.hospitals-container {
+  margin: 20px 0;
+  padding: 20px;
+  background: #f8f9fa;
+  border-radius: 12px;
+}
+
+.hospitals-container h3 {
+  margin: 0 0 20px 0;
+  color: #2c3e50;
+  font-size: 1.3rem;
+}
+
+.specialty-badge {
+  color: #007bff;
+  font-size: 0.9rem;
+  font-weight: normal;
+}
+
+.hospitals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.hospital-card {
+  background: white;
+  padding: 20px;
+  border-radius: 10px;
+  border-left: 4px solid #007bff;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.hospital-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+}
+
+.hospital-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.hospital-header h4 {
+  margin: 0;
+  color: #2c3e50;
+  font-size: 1.2rem;
+}
+
+.hospital-type {
+  background: #e7f3ff;
+  color: #007bff;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.hospital-details p {
+  margin: 10px 0;
+  color: #495057;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hospital-details .icon {
+  font-size: 1.1rem;
+}
+
+.hospital-website a {
+  color: #007bff;
+  text-decoration: none;
+}
+
+.hospital-website a:hover {
+  text-decoration: underline;
+}
+
+.hospital-distance {
+  margin-top: 15px;
+  padding-top: 10px;
+  border-top: 1px solid #e9ecef;
+  color: #007bff;
+  font-size: 1.05rem;
+}
