@@ -29,6 +29,14 @@ const Home = () => {
           <p>Upload prescriptions or medical reports for analysis</p>
           <button className="feature-btn">Upload Document</button>
         </div>
+
+        <div className="feature-card" onClick={() => navigate('/multilingual')}>
+          <div className="feature-icon">🌐</div>
+          <h2>Multilingual Support</h2>
+          <p>Upload documents in Hindi, Tamil, Bengali, and 10+ Indian languages</p>
+          <button className="feature-btn">Try Multilingual</button>
+        </div>
+        
       </div>
 
       <div className="info-section">

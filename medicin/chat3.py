@@ -3,29 +3,33 @@ import os
 import uuid
 from typing import List, Dict, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from llama_index.llms.groq import Groq
+from llama_index.llms.google_genai import GoogleGenAI
 from llama_index.core.memory import Memory
 from datetime import datetime
 from llama_index.core.chat_engine import SimpleChatEngine, ContextChatEngine
 from llama_index.core import Settings
 from medicin.ocr_service import check_image_quality, extract_text_from_image
+from medicin.google_vision_ocr import extract_text_from_image_multilingual, check_image_quality as google_check_quality
+from medicin.translation_service import get_translator, SUPPORTED_LANGUAGES
 from llama_index.core.schema import Document
 from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
-from llama_index.readers.file import PDFReader, ImageReader, DocxReader
+from llama_index.readers.file import PDFReader, DocxReader
 from medicin.sharedembeddings import get_shared_embedding
 from werkzeug.utils import secure_filename
 from medicin.geolocation_service import (
-    find_nearby_hospitals_overpass,
+    find_nearby_hospitals_google,  # Changed from overpass
     format_hospitals_for_chat,
-    extract_specialty_from_symptoms
+    extract_specialty_from_symptoms_hybrid,  # Changed to hybrid with LLM  
 )
 
 import logging
+translator = get_translator()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -50,9 +54,17 @@ app.add_middleware(
 )
 
 # Initialize LLM
-llm = Groq(
-    model="meta-llama/llama-4-maverick-17b-128e-instruct",
-    api_key=os.getenv("GROQ_API_KEY")
+# llm = OpenAI(
+#     model="gpt-5",
+#     api_key=os.getenv("OPENAI_API_KEY"),
+#     temperature=0.0,     # VERY important for medical + classification
+#     max_tokens=512       # Safe default, override per-call if needed
+# )
+llm = GoogleGenAI(
+    model="gemini-2.5-flash",
+    api_key=os.getenv("GEMINI_API_KEY"),
+    temperature=0.0,     # VERY important for medical + classification
+    timeout=30,          # seconds
 )
 
 Settings.llm = llm
@@ -188,6 +200,29 @@ class ChatWithLocationRequest(BaseModel):
     message: str
     pin_code: Optional[str] = None
 
+class MultilingualUploadResponse(BaseModel):
+    session_id: str
+    filename: str
+    message: str
+    pages: int
+    detected_language: str
+    language_name: str
+
+
+class MultilingualChatRequest(BaseModel):
+    session_id: str
+    message: str
+    response_language: str = 'en'  # User can choose response language
+
+
+class MultilingualChatResponse(BaseModel):
+    response_english: str
+    response_translated: str
+    language: str
+    document: str
+    session_id: str
+
+
 
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -202,6 +237,67 @@ async def root():
         "service": "Medical Assistant API",
         "version": "1.0.0"
     }
+
+async def extract_specialty_safe(
+    text: str,
+    llm_instance
+) -> str:
+    """
+    Thread-safe wrapper for Gemini specialty extraction.
+    MUST be used inside FastAPI async endpoints.
+    """
+    return await run_in_threadpool(
+        extract_specialty_from_symptoms_hybrid,
+        text,
+        llm_instance,
+        True
+    )
+
+# Add this after your existing imports and configuration
+def get_combined_documents(prescription_docs: List[Document], include_medicine_db: bool = True) -> List[Document]:
+    """
+    Combine prescription documents with medicine database documents
+    
+    Args:
+        prescription_docs: Documents from uploaded prescription
+        include_medicine_db: Whether to include medicine database
+    
+    Returns:
+        Combined list of documents
+    """
+    if not include_medicine_db:
+        return prescription_docs
+    
+    try:
+        # Query medicine database for relevant medicines
+        # Extract medicine names from prescription
+        prescription_text = " ".join([doc.text for doc in prescription_docs])
+        
+        # Search medicine database
+        medicine_results = medicine_retriever.retrieve(prescription_text)
+        
+        # Convert to Document objects
+        medicine_docs = [
+            Document(
+                text=node.text,
+                metadata={
+                    **node.metadata,
+                    "source": "medicine_database",
+                    "type": "medicine_info"
+                }
+            )
+            for node in medicine_results
+        ]
+        
+        logger.info(f"Added {len(medicine_docs)} medicine database documents to context")
+        
+        # Combine: prescription first, then medicine database
+        return prescription_docs + medicine_docs
+        
+    except Exception as e:
+        logger.error(f"Error fetching medicine database docs: {e}")
+        return prescription_docs  # Fallback to just prescription
+
 
 # ==================== FLOW 1: WITHOUT DOCUMENT ====================
 
@@ -255,7 +351,11 @@ async def chat_symptoms(request: ChatMessage):
             raise HTTPException(status_code=400, detail="This session is not for symptom chat")
         
         # Continue conversation
-        response = session['engine'].chat(request.message)
+        response = await run_in_threadpool(
+            session['chat_engine'].chat,
+            request.message
+        )
+
         response_text = str(response)
         
         # Check if symptom gathering is complete
@@ -444,7 +544,11 @@ async def chat_with_document(request: DocumentChatRequest):
         session['last_accessed'] = datetime.utcnow()
         
         # ✅ Use the STORED chat engine (preserves conversation history)
-        response = session['chat_engine'].chat(request.message)
+        response = await run_in_threadpool(
+            session['chat_engine'].chat,
+            request.message
+        )
+
         
         logger.info(f"Document query processed for session: {request.session_id}")
         
@@ -466,8 +570,8 @@ async def chat_with_document(request: DocumentChatRequest):
 @app.post("/find_nearby_hospitals", response_model=LocationResponse)
 async def find_nearby_hospitals(request: LocationRequest):
     """
-    Find nearby hospitals/clinics based on PIN code and optional specialty.
-    Uses OpenStreetMap data via Overpass API + geopy.
+    Find nearby hospitals/clinics using Google Maps Places API.
+    Includes ratings, reviews, and business hours.
     """
     try:
         # Validate PIN code format
@@ -477,8 +581,8 @@ async def find_nearby_hospitals(request: LocationRequest):
                 detail="Invalid PIN code. Must be 6 digits."
             )
         
-        # Search for hospitals
-        geo_result = find_nearby_hospitals_overpass(
+        # Search for hospitals using Google Maps
+        geo_result = find_nearby_hospitals_google(  # Changed function name
             pin_code=request.pin_code,
             specialty=request.specialty,
             radius_km=request.radius_km
@@ -490,7 +594,7 @@ async def find_nearby_hospitals(request: LocationRequest):
         # Format for display
         formatted = format_hospitals_for_chat(geo_result)
         
-        logger.info(f"Location query: PIN {request.pin_code}, "
+        logger.info(f"Google Maps query: PIN {request.pin_code}, "  # Updated log message
                    f"Specialty: {request.specialty or 'Any'}, "
                    f"Found: {len(geo_result['hospitals'])}")
         
@@ -509,11 +613,11 @@ async def find_nearby_hospitals(request: LocationRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @app.post("/chat_symptoms_with_location")
 async def chat_symptoms_with_location(request: ChatWithLocationRequest):
     """
-    Enhanced symptom chat that includes nearby hospital recommendations.
-    Automatically detects specialty from symptoms.
+    Enhanced symptom chat with Google Maps hospital recommendations.
     """
     try:
         if not request.session_id or request.session_id not in user_sessions:
@@ -524,29 +628,33 @@ async def chat_symptoms_with_location(request: ChatWithLocationRequest):
         if session['type'] != 'symptom':
             raise HTTPException(status_code=400, detail="This session is not for symptom chat")
         
-        # Continue conversation
-        response = session['engine'].chat(request.message)
+        response = await run_in_threadpool(
+            session['chat_engine'].chat,
+            request.message
+        )
+
         response_text = str(response)
         
-        # Check if symptom gathering is complete
         if "SYMPTOMS_COMPLETE" in response_text:
-            # Extract symptoms
             all_messages = session['memory'].get_all()
             user_symptoms = " ".join([m.content for m in all_messages if m.role == "user"])
             
-            # Get medicine recommendation
             medicine_response = medicine_chat_engine.chat(user_symptoms)
             
-            # NEW: Find nearby specialists if PIN provided
             location_info = None
             if request.pin_code:
-                # Auto-detect specialty from symptoms
-                specialty = extract_specialty_from_symptoms(user_symptoms)
+                # Changed: Use LLM-based specialty extraction
+                specialty = await extract_specialty_safe(
+                    user_symptoms,
+                    llm
+                )
+
                 
-                logger.info(f"Finding specialists for PIN {request.pin_code}, "
+                logger.info(f"Google Maps search: PIN {request.pin_code}, "
                            f"specialty: {specialty or 'General'}")
                 
-                geo_result = find_nearby_hospitals_overpass(
+                # Changed: Use Google Maps function
+                geo_result = find_nearby_hospitals_google(
                     pin_code=request.pin_code,
                     specialty=specialty,
                     radius_km=10
@@ -583,8 +691,8 @@ async def chat_symptoms_with_location(request: ChatWithLocationRequest):
 @app.post("/chat_document_with_location")
 async def chat_document_with_location(request: ChatWithLocationRequest):
     """
-    Enhanced document chat that can recommend nearby specialists based on
-    prescription/report analysis.
+    Enhanced document chat with Google Maps hospital recommendations.
+    Always searches for hospitals when PIN code is provided.
     """
     try:
         if not request.session_id or request.session_id not in user_sessions:
@@ -595,37 +703,47 @@ async def chat_document_with_location(request: ChatWithLocationRequest):
         if session['type'] != 'document':
             raise HTTPException(status_code=400, detail="This session does not have a document")
         
-        # Update last accessed
         session['last_accessed'] = datetime.utcnow()
         
-        # Chat with document
-        response = session['chat_engine'].chat(request.message)
+        # Get LLM response about the document
+        response = await run_in_threadpool(
+            session['chat_engine'].chat,
+            request.message
+        )
+
         response_text = str(response)
         
-        # NEW: If PIN provided and response mentions specialist/consultation
         location_info = None
-        if request.pin_code and any(keyword in response_text.lower() 
-                                    for keyword in ['specialist', 'consult', 'doctor', 'visit']):
+        
+        # Search for hospitals if PIN code is provided
+        if request.pin_code:
             
-            # Extract document text for specialty detection
-            doc_text = " ".join([doc.text for doc in session['documents']])
-            specialty = extract_specialty_from_symptoms(doc_text + " " + response_text)
+            # Extract specialty from LLM's response
+            specialty = await extract_specialty_safe(
+                response_text,
+                llm
+            )
+
             
-            logger.info(f"Document suggests specialist consultation. "
-                       f"Finding hospitals for PIN {request.pin_code}")
+            logger.info(f"Finding hospitals for PIN {request.pin_code}, "
+                       f"specialty detected: {specialty}")
             
-            geo_result = find_nearby_hospitals_overpass(
+            # Search hospitals with Google Maps
+            geo_result = find_nearby_hospitals_google(
                 pin_code=request.pin_code,
                 specialty=specialty,
                 radius_km=10
             )
             
-            if geo_result['status'] == 'success':
+            if geo_result['status'] == 'success' and len(geo_result['hospitals']) > 0:
                 location_info = {
                     'hospitals': geo_result['hospitals'],
                     'formatted': format_hospitals_for_chat(geo_result),
                     'specialty_detected': specialty
                 }
+                logger.info(f"Found {len(geo_result['hospitals'])} hospitals for {specialty}")
+            else:
+                logger.warning(f"No hospitals found for PIN {request.pin_code}, specialty {specialty}")
         
         return {
             "response": response_text,
@@ -639,6 +757,231 @@ async def chat_document_with_location(request: ChatWithLocationRequest):
     except Exception as e:
         logger.error(f"Error in document chat with location: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+
+    
+
+@app.post("/upload_multilingual_document", response_model=MultilingualUploadResponse)
+async def upload_multilingual_document(file: UploadFile = File(...)):
+    """
+    Upload medical document in ANY LANGUAGE.
+    Automatically includes medicine database for comprehensive answers.
+    """
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file selected")
+        
+        if not allowed_file(file.filename):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File type not allowed. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            )
+        
+        # Read and save file
+        content = await file.read()
+        
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File size exceeds 16 MB limit")
+        
+        session_id = str(uuid.uuid4())
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(UPLOAD_FOLDER, f"{session_id}_{filename}")
+        
+        with open(filepath, 'wb') as f:
+            f.write(content)
+        
+        # Process based on file type
+        ext = os.path.splitext(filepath)[1].lower()
+        
+        if ext in [".png", ".jpg", ".jpeg"]:
+            quality = google_check_quality(filepath)
+            
+            if not quality["valid"]:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                raise HTTPException(status_code=422, detail=quality["reason"])
+            
+            logger.info(f"Processing multilingual image: {filename}")
+            
+            # Use Google Vision + Deep Translator
+            ocr_result = extract_text_from_image_multilingual(filepath)
+            
+            if not ocr_result or len(ocr_result['english_text'].strip()) < 20:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                raise HTTPException(
+                    status_code=422,
+                    detail="Could not extract sufficient text from image."
+                )
+            
+            # Create document with English text
+            prescription_docs = [Document(
+                text=ocr_result['english_text'],
+                metadata={
+                    "source": filename,
+                    "type": "ocr_image_multilingual",
+                    "original_language": ocr_result['detected_language'],
+                    "language_name": ocr_result['language_name'],
+                    "original_text": ocr_result['original_text'],
+                    "confidence": ocr_result.get('confidence', 0),
+                    "method": ocr_result.get('method', 'google_vision')
+                }
+            )]
+            
+        else:
+            # PDF/DOCX processing
+            file_extractors = {
+                ".pdf": PDFReader(),
+                ".docx": DocxReader(),
+                ".doc": DocxReader()
+            }
+            
+            prescription_docs = SimpleDirectoryReader(
+                input_files=[filepath],
+                file_extractor=file_extractors
+            ).load_data()
+            
+            ocr_result = {
+                'detected_language': 'en',
+                'language_name': 'English'
+            }
+        
+        if not prescription_docs:
+            raise HTTPException(status_code=500, detail="Could not extract content from document")
+        
+        # 🆕 COMBINE PRESCRIPTION + MEDICINE DATABASE
+        all_documents = get_combined_documents(prescription_docs, include_medicine_db=True)
+        
+        logger.info(f"Creating index with {len(all_documents)} documents "
+                   f"({len(prescription_docs)} prescription + {len(all_documents) - len(prescription_docs)} medicine DB)")
+        
+        # Create unified index
+        document_index = VectorStoreIndex.from_documents(
+            all_documents,
+            embed_model=Settings.embed_model
+        )
+        
+        # Enhanced prompt with medicine database context
+        doc_medicine_prompt = (
+            "You are a medical assistant with access to both the uploaded prescription "
+            "and a comprehensive medicine database.\n\n"
+            "When answering questions:\n"
+            "- For 'What medicines are mentioned?': Focus on the prescription\n"
+            "- For 'Alternative medicines' or 'Substitutes': Use the medicine database to suggest "
+            "generic versions, cheaper alternatives, or similar medicines\n"
+            "- For 'Side effects', 'Dosage', 'Interactions': Combine prescription info with database knowledge\n\n"
+            "Context (Prescription + Medicine Database): {context_str}\n"
+            "User Question: {query_str}\n\n"
+            "Provide comprehensive, accurate medical information."
+        )
+        
+        doc_chat_engine = ContextChatEngine.from_defaults(
+            retriever=VectorIndexRetriever(
+                index=document_index, 
+                similarity_top_k=6  # 🆕 Increased from 4 to get more context
+            ),
+            context_template=doc_medicine_prompt,
+            llm=llm,
+            memory=Memory.from_defaults(token_limit=40000)
+        )
+        
+        # Store session
+        user_sessions[session_id] = {
+            'type': 'multilingual_document',
+            'index': document_index,
+            'chat_engine': doc_chat_engine,
+            'filename': filename,
+            'filepath': filepath,
+            'documents': prescription_docs,  # Store original prescription docs
+            'all_documents': all_documents,  # Store combined docs
+            'detected_language': ocr_result.get('detected_language', 'en'),
+            'language_name': ocr_result.get('language_name', 'English'),
+            'created_at': datetime.utcnow(),
+            'last_accessed': datetime.utcnow(),
+            'has_medicine_db': True  # 🆕 Flag to indicate DB access
+        }
+        
+        logger.info(f"Multilingual document with medicine DB uploaded: {filename} "
+                   f"({ocr_result.get('language_name', 'Unknown')})")
+        
+        return MultilingualUploadResponse(
+            session_id=session_id,
+            filename=filename,
+            message=f"Document processed successfully in {ocr_result.get('language_name', 'Unknown')} "
+                   f"with medicine database access",
+            pages=len(prescription_docs),
+            detected_language=ocr_result.get('detected_language', 'en'),
+            language_name=ocr_result.get('language_name', 'English')
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading multilingual document: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+    
+
+@app.post("/chat_multilingual", response_model=MultilingualChatResponse)
+async def chat_multilingual(request: MultilingualChatRequest):
+    """
+    Chat about uploaded multilingual document.
+    User can ask in English, get response in their preferred language.
+    """
+    try:
+        if not request.session_id or request.session_id not in user_sessions:
+            raise HTTPException(status_code=404, detail="Invalid session_id")
+        
+        session = user_sessions[request.session_id]
+        
+        if session['type'] != 'multilingual_document':
+            raise HTTPException(status_code=400, detail="This session is not multilingual")
+        
+        session['last_accessed'] = datetime.utcnow()
+        
+        # Chat in English (LLM processes in English)
+        response = await run_in_threadpool(
+            session['chat_engine'].chat,
+            request.message
+        )
+
+        response_english = str(response)
+        
+        # Translate response to user's preferred language
+        response_translated = response_english
+        if request.response_language != 'en':
+            response_translated = translator.translate_from_english(
+                response_english,
+                request.response_language
+            )
+        
+        logger.info(f"Multilingual chat: {request.session_id} → Response in {request.response_language}")
+        
+        return MultilingualChatResponse(
+            response_english=response_english,
+            response_translated=response_translated,
+            language=request.response_language,
+            document=session['filename'],
+            session_id=request.session_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in multilingual chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/supported_languages")
+async def get_supported_languages():
+    """Get list of supported Indian languages"""
+    return {
+        "languages": [
+            {"code": code, "name": name}
+            for code, name in SUPPORTED_LANGUAGES.items()
+        ]
+    }
 
 
 

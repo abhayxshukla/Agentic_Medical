@@ -16,3 +16,31 @@ body {
 .App {
   min-height: 100vh;
 }
+
+/* Focus visible for keyboard navigation */
+*:focus-visible {
+  outline: 3px solid #667eea;
+  outline-offset: 2px;
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Disable animations for users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Selection color matching theme */
+::selection {
+  background: rgba(102, 126, 234, 0.3);
+  color: #2c3e50;
+}

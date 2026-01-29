@@ -1,156 +1,185 @@
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from geopy.extra.rate_limiter import RateLimiter
-import requests
+import googlemaps
+import os
 from typing import List, Dict, Optional
 import logging
+from dotenv import load_dotenv
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Initialize geocoder with rate limiting
+# Initialize Google Maps client
+gmaps = googlemaps.Client(key=os.getenv('GOOGLE_MAPS_API_KEY'))
+
+# Initialize geocoder with rate limiting (backup)
 geolocator = Nominatim(user_agent="medical_intake_agent_v1")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
 
 
-def find_nearby_hospitals_overpass(
-    pin_code: str, 
-    specialty: Optional[str] = None, 
-    radius_km: float = 10
+def find_nearby_hospitals_google(
+    pin_code: str,
+    specialty: Optional[str] = None,
+    radius_km: float = 10,
+    include_clinics: bool = True
 ) -> Dict:
     """
-    Find nearby hospitals/clinics using Overpass API (OpenStreetMap) + geopy.
-    No dataset required - queries OSM in real-time.
+    Find nearby hospitals/clinics using Google Maps Places API.
+    Returns only essential info: name, address, rating, and business hours.
     
     Args:
         pin_code: Indian PIN code (6 digits)
-        specialty: Medical specialty (e.g., 'gastroenterology', 'cardiology')
-        radius_km: Search radius in kilometers
+        specialty: Medical specialty (e.g., 'cardiology', 'gastroenterology')
+        radius_km: Search radius in kilometers (max 50km for Places API)
+        include_clinics: Whether to include clinics and smaller healthcare facilities
     
     Returns:
-        Dict with status, hospitals list, and metadata
+        Dict with status, hospitals list with minimal essential data
     """
     try:
-        # Step 1: Geocode PIN to coordinates
+        # Step 1: Geocode PIN to coordinates using Google Geocoding API
         logger.info(f"Geocoding PIN: {pin_code}")
-        user_location = geocode(f"{pin_code}, India")
         
-        if not user_location:
+        geocode_result = gmaps.geocode(f"{pin_code}, India")
+        
+        if not geocode_result:
             return {
                 "status": "error",
                 "message": f"Unable to locate PIN code: {pin_code}",
                 "hospitals": []
             }
         
-        lat, lon = user_location.latitude, user_location.longitude
+        location = geocode_result[0]['geometry']['location']
+        lat, lon = location['lat'], location['lng']
+        formatted_address = geocode_result[0]['formatted_address']
+        
         logger.info(f"PIN {pin_code} geocoded to: ({lat}, {lon})")
         
-        # Step 2: Query Overpass API for hospitals/clinics
+        # Step 2: Search for hospitals using Places API
         radius_meters = int(radius_km * 1000)
-        overpass_url = "http://overpass-api.de/api/interpreter"
         
-        overpass_query = f"""
-        [out:json][timeout:25];
-        (
-          node["amenity"="hospital"](around:{radius_meters},{lat},{lon});
-          node["amenity"="clinic"](around:{radius_meters},{lat},{lon});
-          node["amenity"="doctors"](around:{radius_meters},{lat},{lon});
-          way["amenity"="hospital"](around:{radius_meters},{lat},{lon});
-          way["amenity"="clinic"](around:{radius_meters},{lat},{lon});
-        );
-        out center;
-        """
+        # Build search query based on specialty
+        if specialty:
+            query = f"{specialty} hospital near {pin_code}"
+        else:
+            query = "hospital"
         
-        logger.info(f"Querying Overpass API for hospitals within {radius_km}km...")
-        response = requests.get(
-            overpass_url, 
-            params={'data': overpass_query}, 
-            timeout=30
-        )
+        # Use Places API Text Search - request only needed fields
+        search_params = {
+            'query': query,
+            'location': (lat, lon),
+            'radius': radius_meters,
+            'type': 'hospital'
+        }
         
-        if response.status_code != 200:
-            return {
-                "status": "error",
-                "message": f"Overpass API error: {response.status_code}",
-                "hospitals": []
-            }
+        logger.info(f"Searching Google Places for hospitals within {radius_km}km...")
+        places_result = gmaps.places(**search_params)
         
-        data = response.json()
-        
-        # Step 3: Process results and calculate distances
         hospitals = []
         user_coords = (lat, lon)
         
-        for element in data.get('elements', []):
-            # Get coordinates (center for ways, direct lat/lon for nodes)
-            if 'center' in element:
-                hosp_coords = (element['center']['lat'], element['center']['lon'])
-            elif 'lat' in element and 'lon' in element:
-                hosp_coords = (element['lat'], element['lon'])
-            else:
+        # Step 3: Process each place - get only essential details
+        for place in places_result.get('results', []):
+            place_id = place['place_id']
+            
+            # Get place_types from search results (not from details)
+            place_types = place.get('types', [])
+            
+            # Filter out non-hospitals if include_clinics is False
+            if not include_clinics and 'hospital' not in place_types:
                 continue
             
-            # Calculate geodesic distance
+            # Get detailed information - ONLY request valid fields
+            place_details = gmaps.place(
+                place_id=place_id,
+                fields=[
+                    'name',
+                    'formatted_address',
+                    'rating',
+                    'user_ratings_total',
+                    'opening_hours',
+                    'geometry',
+                    'business_status'
+                    # 'types' is NOT a valid field for place() - removed
+                ]
+            )
+            
+            details = place_details.get('result', {})
+            
+            # Get coordinates
+            place_location = details['geometry']['location']
+            hosp_coords = (place_location['lat'], place_location['lng'])
+            
+            # Calculate actual distance
             distance = geodesic(user_coords, hosp_coords).km
             
-            # Get details from tags
-            tags = element.get('tags', {})
-            name = tags.get('name', 'Unnamed Healthcare Facility')
-            amenity_type = tags.get('amenity', 'hospital')
+            # Skip if beyond radius
+            if distance > radius_km:
+                continue
             
-            # Build address
-            address_parts = []
-            if tags.get('addr:full'):
-                address_parts.append(tags['addr:full'])
-            else:
-                if tags.get('addr:street'):
-                    address_parts.append(tags['addr:street'])
-                if tags.get('addr:city'):
-                    address_parts.append(tags['addr:city'])
+            # Extract opening hours
+            opening_hours = None
+            is_open_now = None
+            if 'opening_hours' in details:
+                opening_hours = details['opening_hours'].get('weekday_text', [])
+                is_open_now = details['opening_hours'].get('open_now', None)
             
-            address = ', '.join(address_parts) if address_parts else 'Address not available'
-            
-            # Get contact info
-            phone = tags.get('phone', tags.get('contact:phone', 'N/A'))
-            website = tags.get('website', tags.get('contact:website', 'N/A'))
-            
-            # Check specialty match (if provided)
+            # Check specialty match
             specialty_match = True
             if specialty:
                 specialty_lower = specialty.lower()
-                healthcare_specialty = tags.get('healthcare:speciality', '').lower()
-                description = tags.get('description', '').lower()
+                name_lower = details.get('name', '').lower()
+                address_lower = details.get('formatted_address', '').lower()
+                # Use types from search results, not details
+                types_str = ' '.join(place_types).lower()
                 
-                # Simple keyword matching
-                if specialty_lower not in name.lower() and \
-                   specialty_lower not in healthcare_specialty and \
-                   specialty_lower not in description:
+                if specialty_lower not in name_lower and \
+                   specialty_lower not in address_lower and \
+                   specialty_lower not in types_str:
                     specialty_match = False
             
-            hospitals.append({
-                'name': name,
-                'type': amenity_type.title(),
-                'address': address,
-                'phone': phone,
-                'website': website,
+            # Build minimal hospital data object
+            hospital_data = {
+                'place_id': place_id,
+                'name': details.get('name', 'Unnamed Healthcare Facility'),
+                'type': 'Hospital' if 'hospital' in place_types else 'Clinic',
+                'address': details.get('formatted_address', 'Address not available'),
                 'distance_km': round(distance, 2),
+                'rating': details.get('rating', 0),
+                'total_ratings': details.get('user_ratings_total', 0),
+                'is_open_now': is_open_now,
+                'opening_hours': opening_hours,
+                'business_status': details.get('business_status', 'UNKNOWN'),
                 'coordinates': {
                     'latitude': hosp_coords[0],
                     'longitude': hosp_coords[1]
                 },
+                'google_maps_url': f"https://www.google.com/maps/place/?q=place_id:{place_id}",
                 'specialty_match': specialty_match
-            })
+            }
+            
+            hospitals.append(hospital_data)
         
-        # Sort by distance
-        hospitals = sorted(hospitals, key=lambda x: x['distance_km'])
-        
-        # Filter by specialty if provided (prioritize matches, but include others)
+        # Sort by specialty match first, then by rating, then by distance
         if specialty:
-            specialty_matches = [h for h in hospitals if h['specialty_match']]
-            other_hospitals = [h for h in hospitals if not h['specialty_match']]
-            hospitals = specialty_matches + other_hospitals
+            hospitals = sorted(
+                hospitals,
+                key=lambda x: (
+                    not x['specialty_match'],  # specialty matches first
+                    -x['rating'],  # higher rating first
+                    x['distance_km']  # closer distance first
+                )
+            )
+        else:
+            # Sort by rating and distance
+            hospitals = sorted(
+                hospitals,
+                key=lambda x: (-x['rating'], x['distance_km'])
+            )
         
-        # Limit to top 5
-        hospitals = hospitals[:5]
+        # Limit to top 10
+        hospitals = hospitals[:10]
         
         logger.info(f"Found {len(hospitals)} hospitals near PIN {pin_code}")
         
@@ -160,19 +189,19 @@ def find_nearby_hospitals_overpass(
             "location": {
                 "latitude": lat,
                 "longitude": lon,
-                "address": user_location.address
+                "address": formatted_address
             },
             "radius_km": radius_km,
             "specialty_filter": specialty,
             "hospitals": hospitals,
-            "total_found": len(data.get('elements', []))
+            "total_found": len(places_result.get('results', []))
         }
         
-    except requests.Timeout:
-        logger.error("Overpass API timeout")
+    except googlemaps.exceptions.ApiError as e:
+        logger.error(f"Google Maps API error: {e}")
         return {
             "status": "error",
-            "message": "Request timeout. Please try again.",
+            "message": f"Google Maps API error: {str(e)}",
             "hospitals": []
         }
     except Exception as e:
@@ -184,9 +213,11 @@ def find_nearby_hospitals_overpass(
         }
 
 
+
 def format_hospitals_for_chat(geo_result: Dict) -> str:
     """
     Format geolocation results for chat engine response.
+    Shows only: name, address, rating, hours, distance.
     """
     if geo_result['status'] != 'success':
         return f"❌ {geo_result['message']}"
@@ -211,37 +242,222 @@ def format_hospitals_for_chat(geo_result: Dict) -> str:
     for idx, hospital in enumerate(hospitals, 1):
         result += f"{idx}. **{hospital['name']}** ({hospital['type']})\n"
         result += f"   📍 {hospital['address']}\n"
-        result += f"   📞 {hospital['phone']}\n"
-        if hospital['website'] != 'N/A':
-            result += f"   🌐 {hospital['website']}\n"
-        result += f"   📏 Distance: {hospital['distance_km']} km\n\n"
+        result += f"   ⭐ Rating: {hospital['rating']}/5 ({hospital['total_ratings']} reviews)\n"
+        
+        if hospital['is_open_now'] is not None:
+            status = "🟢 Open Now" if hospital['is_open_now'] else "🔴 Closed"
+            result += f"   {status}\n"
+        
+        # Show today's hours if available
+        if hospital['opening_hours'] and len(hospital['opening_hours']) > 0:
+            from datetime import datetime
+            today_idx = datetime.now().weekday()
+            if today_idx < len(hospital['opening_hours']):
+                result += f"   🕐 {hospital['opening_hours'][today_idx]}\n"
+        
+        result += f"   📏 Distance: {hospital['distance_km']} km\n"
+        result += f"   🗺️ [View on Google Maps]({hospital['google_maps_url']})\n\n"
     
     return result
 
 
-def extract_specialty_from_symptoms(symptoms_text: str) -> Optional[str]:
+def extract_specialty_from_symptoms_llm(symptoms_text: str, llm_instance) -> Optional[str]:
     """
-    Extract medical specialty from symptoms or prescription analysis.
-    Simple keyword matching - can be enhanced with LLM.
+    LLM-based specialty extraction optimized for GPT-5.
+    Deterministic, closed-set, medical-safe classification.
     """
+
+    specialty_prompt = f"""
+You are a medical triage classification engine.
+
+TASK:
+Classify the medical information below into ONE medical specialty.
+
+STRICT RULES:
+- Choose ONLY from the allowed list
+- Output EXACTLY one specialty
+- Output ONLY the specialty name
+- No explanations
+- No punctuation
+- No markdown
+- Lowercase only
+- If unclear, output "general medicine"
+
+PRIORITY RULES:
+- Cancer, tumor, malignancy, chemotherapy, radiotherapy → oncology
+- Severe infection, fungal infection, sepsis, IV antimicrobials → infectious disease
+- If multiple specialties apply → choose the MOST critical one
+
+ALLOWED SPECIALTIES:
+infectious disease
+oncology
+cardiology
+gastroenterology
+dermatology
+orthopedics
+neurology
+ophthalmology
+ent
+pulmonology
+endocrinology
+nephrology
+gynecology
+pediatrics
+psychiatry
+general medicine
+
+MEDICAL INFORMATION:
+<<<
+{symptoms_text}
+>>>
+
+FINAL ANSWER:
+"""
+
+    try:
+        response = llm_instance.complete(
+            specialty_prompt,
+            max_tokens=8  # 🔥 Important: forces single-label output
+        )
+    except Exception as e:
+        logger.error(f"LLM specialty extraction error: {e}")
+        return "general medicine"
+
+    specialty = str(response).strip().lower()
+    specialty = specialty.replace(".", "").strip()
+
+    valid_specialties = {
+        'infectious disease',
+        'oncology',
+        'cardiology',
+        'gastroenterology',
+        'dermatology',
+        'orthopedics',
+        'neurology',
+        'ophthalmology',
+        'ent',
+        'pulmonology',
+        'endocrinology',
+        'nephrology',
+        'gynecology',
+        'pediatrics',
+        'psychiatry',
+        'general medicine'
+    }
+
+    if specialty in valid_specialties:
+        logger.info(f"LLM detected specialty: {specialty}")
+        return specialty
+
+    logger.warning(f"Unrecognized LLM output '{specialty}', defaulting to general medicine")
+    return "general medicine"
+
+
+
+
+
+def extract_specialty_from_symptoms_hybrid(symptoms_text: str, llm_instance, use_llm: bool = True) -> Optional[str]:
+    """
+    Hybrid approach: Try LLM first, fallback to keyword matching.
+    
+    Args:
+        symptoms_text: User's symptoms or prescription text
+        llm_instance: Your Groq LLM instance
+        use_llm: Whether to use LLM (set False to use keywords only)
+    
+    Returns:
+        Detected specialty
+    """
+    if use_llm:
+        try:
+            specialty = extract_specialty_from_symptoms_llm(symptoms_text, llm_instance)
+            if specialty:
+                return specialty
+        except Exception as e:
+            logger.warning(f"LLM specialty extraction failed, falling back to keywords: {e}")
+    
+    # Fallback to enhanced keyword matching
     symptoms_lower = symptoms_text.lower()
     
     specialty_keywords = {
-        'cardiology': ['heart', 'cardiac', 'chest pain', 'blood pressure', 'hypertension'],
-        'gastroenterology': ['stomach', 'gastric', 'digestion', 'acidity', 'ulcer', 'abdomen'],
-        'dermatology': ['skin', 'rash', 'acne', 'dermatitis', 'eczema'],
-        'orthopedics': ['bone', 'joint', 'fracture', 'arthritis', 'back pain'],
-        'neurology': ['headache', 'migraine', 'nerve', 'neurological', 'seizure'],
-        'ophthalmology': ['eye', 'vision', 'sight', 'cataract'],
-        'ent': ['ear', 'nose', 'throat', 'hearing', 'sinus'],
-        'pulmonology': ['lung', 'breathing', 'asthma', 'cough', 'respiratory'],
-        'endocrinology': ['diabetes', 'thyroid', 'hormone'],
-        'nephrology': ['kidney', 'renal', 'urinary']
+        'infectious disease': [
+            'fungal', 'bacterial', 'viral', 'infection', 'sepsis', 
+            'amphotericin', 'antifungal', 'antibiotic', 'antimicrobial',
+            'isavuconazole', 'fluconazole', 'voriconazole'
+        ],
+        'oncology': [
+            'cancer', 'tumor', 'tumour', 'chemotherapy', 'radiation',
+            'oncology', 'oncologist', 'malignancy', 'carcinoma', 'sarcoma',
+            'leukemia', 'lymphoma', 'metastasis'
+        ],
+        'cardiology': [
+            'heart', 'cardiac', 'chest pain', 'blood pressure', 
+            'hypertension', 'palpitation', 'ecg', 'angioplasty'
+        ],
+        'gastroenterology': [
+            'stomach', 'gastric', 'digestion', 'acidity', 'ulcer', 
+            'abdomen', 'intestine', 'liver', 'ibs', 'crohn'
+        ],
+        'dermatology': [
+            'skin', 'rash', 'acne', 'dermatitis', 'eczema', 'psoriasis',
+            'dermatologist'
+        ],
+        'orthopedics': [
+            'bone', 'joint', 'fracture', 'arthritis', 'back pain', 
+            'spine', 'orthopedic', 'ligament', 'tendon'
+        ],
+        'neurology': [
+            'headache', 'migraine', 'nerve', 'neurological', 'seizure', 
+            'brain', 'stroke', 'parkinson', 'alzheimer'
+        ],
+        'ophthalmology': [
+            'eye', 'vision', 'sight', 'cataract', 'glaucoma', 
+            'retina', 'ophthalmologist'
+        ],
+        'ent': [
+            'ear', 'nose', 'throat', 'hearing', 'sinus', 'tonsil',
+            'ent specialist'
+        ],
+        'pulmonology': [
+            'lung', 'breathing', 'asthma', 'cough', 'respiratory', 
+            'bronchitis', 'copd', 'pneumonia'
+        ],
+        'endocrinology': [
+            'diabetes', 'thyroid', 'hormone', 'insulin', 'endocrine',
+            'pituitary', 'adrenal'
+        ],
+        'nephrology': [
+            'kidney', 'renal', 'urinary', 'dialysis', 'nephrologist',
+            'creatinine'
+        ],
+        'gynecology': [
+            'pregnancy', 'menstrual', 'ovarian', 'uterus', 'gynae',
+            'gynecologist', 'pcos', 'menopause'
+        ],
+        'pediatrics': [
+            'child', 'infant', 'baby', 'pediatric', 'vaccination',
+            'pediatrician', 'newborn'
+        ]
     }
     
-    for specialty, keywords in specialty_keywords.items():
+    # Check for specialty keywords (prioritize specific ones first)
+    # Check infectious disease and oncology first as they're often missed
+    for specialty in ['infectious disease', 'oncology']:
+        keywords = specialty_keywords.get(specialty, [])
         if any(keyword in symptoms_lower for keyword in keywords):
-            logger.info(f"Detected specialty: {specialty}")
+            logger.info(f"Keyword detected specialty: {specialty}")
             return specialty
     
-    return None
+    # Then check other specialties
+    for specialty, keywords in specialty_keywords.items():
+        if specialty not in ['infectious disease', 'oncology']:  # Already checked
+            if any(keyword in symptoms_lower for keyword in keywords):
+                logger.info(f"Keyword detected specialty: {specialty}")
+                return specialty
+    
+    logger.info("No specific specialty detected, using general medicine")
+    return "general medicine"
+
+
+
+

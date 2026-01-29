@@ -72,6 +72,25 @@ export const findNearbyHospitals = async (pinCode, specialty = null, radiusKm = 
   return response.data;
 };
 
+export const uploadMultilingualDocument = async (file) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  
+  const response = await api.post('/upload_multilingual_document', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' }
+  });
+  return response.data;
+};
+
+export const chatMultilingual = async (sessionId, message, responseLanguage = 'en') => {
+  const response = await api.post('/chat_multilingual', {
+    session_id: sessionId,
+    message: message,
+    response_language: responseLanguage
+  });
+  return response.data;
+};
+
 // Session Management
 export const deleteSession = async (sessionId) => {
   const response = await api.post('/delete_session', {

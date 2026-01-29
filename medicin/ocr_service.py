@@ -6,6 +6,7 @@ from typing import Optional, Dict
 import logging
 import os
 from dotenv import load_dotenv
+from medicin.translation_service import get_translator, SUPPORTED_LANGUAGES
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,37 @@ def check_image_quality(image_path: str) -> dict:
         
     except Exception as e:
         return {"valid": False, "reason": f"Error checking image: {str(e)}"}
+
+def extract_text_from_image_multilingual(image_path: str):
+    """
+    Extract text from image and detect language
+    Returns: dict with 'text', 'language', 'english_text'
+    """
+    logger.info(f"🔍 Starting multilingual OCR for: {image_path}")
+    
+    # Step 1: Extract text using existing method
+    extracted_text = extract_text_from_image(image_path)
+    
+    if not extracted_text:
+        return None
+    
+    # Step 2: Detect language
+    translator = get_translator()
+    detected_lang = translator.detect_language(extracted_text)
+    
+    logger.info(f"Detected language: {detected_lang}")
+    
+    # Step 3: Translate to English if needed
+    english_text = extracted_text
+    if detected_lang != 'en':
+        english_text = translator.translate_to_english(extracted_text, detected_lang)
+    
+    return {
+        'original_text': extracted_text,
+        'detected_language': detected_lang,
+        'english_text': english_text,
+        'language_name': SUPPORTED_LANGUAGES.get(detected_lang, 'Unknown')
+    }
 
 
 # Keep for backward compatibility (your original function name)

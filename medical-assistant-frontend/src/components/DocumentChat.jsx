@@ -1,8 +1,9 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { uploadDocument, chatWithDocument, chatDocumentWithLocation } from '../services/api';
 import LocationSearch from './LocationSearch';
 import HospitalList from './HospitalList';
 import './DocumentChat.css';
+
 
 const DocumentChat = () => {
   const [sessionId, setSessionId] = useState(null);
@@ -13,17 +14,25 @@ const DocumentChat = () => {
   const [uploading, setUploading] = useState(false);
   const [nearbyHospitals, setNearbyHospitals] = useState(null);
   const [loadingHospitals, setLoadingHospitals] = useState(false);
+  const [showLocationSearch, setShowLocationSearch] = useState(false);
   
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
+
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, showLocationSearch]);
+
+
   const handleFileUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
+
 
     try {
       setUploading(true);
@@ -34,6 +43,8 @@ const DocumentChat = () => {
         role: 'system',
         content: `Document "${response.filename}" uploaded successfully! (${response.pages} pages). You can now ask questions about it.`
       }]);
+      setShowLocationSearch(false); // Reset location search on new upload
+      setNearbyHospitals(null); // Clear previous hospital results
     } catch (error) {
       console.error('Error uploading document:', error);
       alert(error.response?.data?.detail || 'Failed to upload document. Please try again.');
@@ -42,8 +53,10 @@ const DocumentChat = () => {
     }
   };
 
+
   const handleSendMessage = async () => {
     if (!inputMessage.trim() || loading || !sessionId) return;
+
 
     const userMessage = inputMessage;
     setInputMessage('');
@@ -53,15 +66,20 @@ const DocumentChat = () => {
       content: userMessage
     }]);
 
+
     try {
       setLoading(true);
       const response = await chatWithDocument(sessionId, userMessage);
+
 
       setMessages(prev => [...prev, {
         role: 'assistant',
         content: response.response
       }]);
 
+      // Show location search after assistant responds
+      setShowLocationSearch(true);
+      
       scrollToBottom();
     } catch (error) {
       console.error('Error sending message:', error);
@@ -74,35 +92,64 @@ const DocumentChat = () => {
     }
   };
 
+
   const handleLocationSearch = async (pinCode) => {
+    if (!sessionId) return;
+
     setLoadingHospitals(true);
+    setNearbyHospitals(null); // Clear previous results
+
     try {
+      // Get the last assistant message as context
+      const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant');
+      const contextMessage = lastAssistantMessage?.content || 'Find nearby specialists based on this prescription.';
+
       const response = await chatDocumentWithLocation(
         sessionId,
-        'Should I consult a specialist? Find nearby hospitals.',
+        contextMessage,
         pinCode
       );
 
-      // Add AI response to chat
-      if (response.response) {
+
+      // Only add new response if it's different from the last one
+      if (response.response && response.response !== lastAssistantMessage?.content) {
         setMessages(prev => [...prev, {
           role: 'assistant',
           content: response.response
         }]);
       }
 
+
       if (response.location_info) {
         setNearbyHospitals(response.location_info);
+        
+        // Add a system message about hospitals found
+        setMessages(prev => [...prev, {
+          role: 'system',
+          content: `📍 Found ${response.location_info.hospitals.length} nearby healthcare facilities${
+            response.location_info.specialty_detected 
+              ? ` for ${response.location_info.specialty_detected}` 
+              : ''
+          }.`
+        }]);
       } else {
-        alert('No specialist recommendation found for this document.');
+        setMessages(prev => [...prev, {
+          role: 'system',
+          content: '⚠️ No specialist recommendation found. Try asking about the diagnosis first.'
+        }]);
       }
     } catch (error) {
       console.error('Error finding hospitals:', error);
-      alert('Failed to find hospitals. Please try again.');
+      setMessages(prev => [...prev, {
+        role: 'error',
+        content: 'Failed to find nearby hospitals. Please try again.'
+      }]);
     } finally {
       setLoadingHospitals(false);
+      scrollToBottom();
     }
   };
+
 
   const handleKeyPress = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -111,12 +158,14 @@ const DocumentChat = () => {
     }
   };
 
+
   return (
     <div className="document-chat-container">
       <div className="chat-header">
         <h2>📄 Document Analysis Chat</h2>
         <p>Upload prescription, blood report, or medical document</p>
       </div>
+
 
       {!sessionId ? (
         <div className="upload-section">
@@ -148,6 +197,7 @@ const DocumentChat = () => {
             <p>📄 Analyzing: <strong>{documentName}</strong></p>
           </div>
 
+
           <div className="chat-messages">
             {messages.map((msg, idx) => (
               <div key={idx} className={`message ${msg.role}`}>
@@ -166,12 +216,17 @@ const DocumentChat = () => {
             <div ref={messagesEndRef} />
           </div>
 
-          <LocationSearch 
-            onSearch={handleLocationSearch}
-            loading={loadingHospitals}
-          />
+          {/* Show location search only after at least one assistant response */}
+          {showLocationSearch && messages.some(m => m.role === 'assistant') && (
+            <LocationSearch 
+              onSearch={handleLocationSearch}
+              loading={loadingHospitals}
+            />
+          )}
 
+          {/* Show hospital list if available */}
           <HospitalList locationInfo={nearbyHospitals} />
+
 
           <div className="chat-input-area">
             <input
@@ -191,5 +246,6 @@ const DocumentChat = () => {
     </div>
   );
 };
+
 
 export default DocumentChat;
